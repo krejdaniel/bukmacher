@@ -1,0 +1,26 @@
+@'
+# Sekrety i konfiguracja lokalna
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Środowiska wirtualne
+venv/
+.venv/
+backend/venv/
+frontend/venv/
+
+# Środowisko programistyczne
+.idea/
+.vscode/
+
+# Pliki tymczasowe
+*.log
+'@ | Set-Content -Encoding utf8 ".gitignore"
