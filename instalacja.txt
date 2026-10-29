@@ -1,0 +1,4 @@
+w powershelu w tym folderze:
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+jak nie masz postgreSQL to otworzy ci się, pobierz pierwszy, nie musisz nic pobierac z stack buildera dodatkowego
