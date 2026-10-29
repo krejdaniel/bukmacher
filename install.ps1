@@ -6,14 +6,42 @@ $Backend = Join-Path $ProjectRoot "backend"
 $Frontend = Join-Path $ProjectRoot "frontend"
 $Venv = Join-Path $Backend "venv"
 $Python = Join-Path $Venv "Scripts\python.exe"
+$BackupFile = Join-Path $ProjectRoot "football_predictor.backup"
 
 function Write-Step($Message) {
     Write-Host "`n=== $Message ===" -ForegroundColor Cyan
 }
 
+function Get-EnvValue($Name, $Default = "") {
+    $EnvFile = Join-Path $Backend ".env"
+
+    if (Test-Path $EnvFile) {
+        $Line = Get-Content $EnvFile |
+            Where-Object { $_ -match "^\s*$([regex]::Escape($Name))\s*=" } |
+            Select-Object -Last 1
+
+        if ($Line) {
+            $Value = ($Line -split "=", 2)[1].Trim()
+
+            if ($Value.Length -ge 2) {
+                if (
+                    ($Value.StartsWith('"') -and $Value.EndsWith('"')) -or
+                    ($Value.StartsWith("'") -and $Value.EndsWith("'"))
+                ) {
+                    $Value = $Value.Substring(1, $Value.Length - 2)
+                }
+            }
+
+            return $Value
+        }
+    }
+
+    return $Default
+}
+
 try {
     # ---------------------------------------------------------
-    # 1. Sprawdzenie wymaganych plikow
+    # 1. Sprawdzenie plikow projektu i Pythona
     # ---------------------------------------------------------
 
     Write-Step "Sprawdzanie plikow projektu"
@@ -22,25 +50,28 @@ try {
         throw "Nie znaleziono launchera py. Zainstaluj Python 3.13 i zaznacz opcje dodania do PATH."
     }
 
-    if (-not (Test-Path (Join-Path $Backend "requirements.txt"))) {
-        throw "Nie znaleziono backend\requirements.txt."
-    }
+    $RequiredFiles = @(
+        (Join-Path $Backend "requirements.txt"),
+        (Join-Path $Backend "setup_database.py"),
+        (Join-Path $Backend "create_tables.py"),
+        (Join-Path $Frontend "main.py")
+    )
 
-    if (-not (Test-Path (Join-Path $Backend "setup_database.py"))) {
-        throw "Nie znaleziono backend\setup_database.py."
-    }
-
-    if (-not (Test-Path (Join-Path $Backend "create_tables.py"))) {
-        throw "Nie znaleziono backend\create_tables.py."
-    }
-
-    if (-not (Test-Path (Join-Path $Frontend "main.py"))) {
-        throw "Nie znaleziono frontend\main.py."
+    foreach ($File in $RequiredFiles) {
+        if (-not (Test-Path $File)) {
+            throw "Nie znaleziono wymaganego pliku: $File"
+        }
     }
 
     if (-not (Test-Path (Join-Path $ProjectRoot "UruchomFootballPredictor.vbs"))) {
-        Write-Host "Uwaga: nie znaleziono UruchomFootballPredictor.vbs w katalogu glownym." -ForegroundColor Yellow
-        Write-Host "Instalacja zaleznosci bedzie kontynuowana."
+        Write-Host "Uwaga: nie znaleziono UruchomFootballPredictor.vbs." -ForegroundColor Yellow
+    }
+
+    if (Test-Path $BackupFile) {
+        Write-Host "Znaleziono kopie bazy: $BackupFile" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Nie znaleziono football_predictor.backup. Instalacja przygotuje pusta baze." -ForegroundColor Yellow
     }
 
     # ---------------------------------------------------------
@@ -92,6 +123,14 @@ try {
         throw "Nie udalo sie zainstalowac PySide6."
     }
 
+    Write-Step "Instalacja przegladarki Chromium dla Playwright"
+
+    & $Python -m playwright install chromium
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Nie udalo sie pobrac przegladarki Chromium wymaganej przez Playwright."
+    }
+
     # ---------------------------------------------------------
     # 4. Konfiguracja pliku .env
     # ---------------------------------------------------------
@@ -109,31 +148,79 @@ DB_USER=postgres
 DB_PASSWORD=
 '@ | Set-Content -Path $EnvFile -Encoding utf8
 
-        Write-Host "Utworzono backend\.env." -ForegroundColor Yellow
-        Write-Host "Ustaw lokalne dane PostgreSQL, w tym DB_PASSWORD, przed kontynuacja."
+        Write-Host "Utworzono backend\.env."
     }
     else {
         Write-Host "Istniejacy backend\.env pozostawiono bez zmian."
     }
 
     # ---------------------------------------------------------
-    # 5. Sprawdzenie PostgreSQL przed tworzeniem bazy
+    # 5. Wykrycie PostgreSQL
     # ---------------------------------------------------------
 
-    Write-Step "Sprawdzanie uslugi PostgreSQL"
+    Write-Step "Sprawdzanie PostgreSQL"
 
-    $PgService = Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue |
+    $PgServices = @(
+        Get-Service -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -like "*postgres*" -or
+                $_.DisplayName -like "*postgres*"
+            }
+    )
+
+    $PgService = $PgServices |
         Where-Object { $_.Status -eq "Running" } |
         Select-Object -First 1
 
     if (-not $PgService) {
-        throw "Nie wykryto uruchomionej uslugi PostgreSQL. Zainstaluj PostgreSQL, uruchom usluge i ponownie uruchom instalator."
+        Write-Host ""
+        Write-Host "Nie wykryto uruchomionego PostgreSQL." -ForegroundColor Yellow
+        Write-Host "Otwieram oficjalna strone pobierania PostgreSQL dla Windows."
+        Write-Host ""
+        Write-Host "Zainstaluj PostgreSQL i zapamietaj haslo uzytkownika postgres."
+
+        Start-Process "https://www.postgresql.org/download/windows/"
+
+        Read-Host "Po zainstalowaniu PostgreSQL nacisnij Enter"
+
+        $PgServices = @(
+            Get-Service -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -like "*postgres*" -or
+                    $_.DisplayName -like "*postgres*"
+                }
+        )
+
+        $PgService = $PgServices |
+            Where-Object { $_.Status -eq "Running" } |
+            Select-Object -First 1
+
+        if (-not $PgService) {
+            $StoppedService = $PgServices | Select-Object -First 1
+
+            if ($StoppedService) {
+                Write-Host "Proba uruchomienia uslugi: $($StoppedService.Name)"
+
+                try {
+                    Start-Service -Name $StoppedService.Name
+                    Start-Sleep -Seconds 3
+                    $PgService = Get-Service -Name $StoppedService.Name
+                }
+                catch {
+                    throw "Nie udalo sie uruchomic uslugi PostgreSQL. Uruchom ja recznie i ponownie uruchom instalator."
+                }
+            }
+        }
+
+        if (-not $PgService -or $PgService.Status -ne "Running") {
+            throw "Nie wykryto dzialajacej uslugi PostgreSQL. Sprawdz, czy instalacja zostala zakonczona."
+        }
     }
 
-    Write-Host "Wykryto usluge: $($PgService.Name)" -ForegroundColor Green
+    Write-Host "PostgreSQL dziala: $($PgService.Name)" -ForegroundColor Green
 
     # ---------------------------------------------------------
-    # 6. Utworzenie bazy i tabel
+    # 6. Przygotowanie bazy i tabel
     # ---------------------------------------------------------
 
     Write-Step "Przygotowanie bazy PostgreSQL"
@@ -158,14 +245,118 @@ DB_PASSWORD=
     }
 
     # ---------------------------------------------------------
-    # 7. Koniec - bez tworzenia skrotow i dodatkowych VBS
+    # 7. Przywracanie danych z kopii
+    # ---------------------------------------------------------
+
+    if (Test-Path $BackupFile) {
+        Write-Step "Przywracanie bazy z kopii zapasowej"
+
+        Write-Host ""
+        Write-Host "UWAGA: przywracanie moze zastapic tabele i dane w bazie docelowej!" -ForegroundColor Yellow
+        Write-Host "Plik kopii: $BackupFile"
+        Write-Host "Baza docelowa: $(Get-EnvValue 'DB_NAME' 'football_predictor')"
+        Write-Host ""
+
+        $Confirmation = Read-Host "Aby przywrocic kopie i zastapic istniejace obiekty, wpisz TAK"
+
+        if ($Confirmation -ceq "TAK") {
+            $PgBin = "C:\Program Files\PostgreSQL"
+
+            $PgRestoreCandidates = @()
+
+            if (Test-Path $PgBin) {
+                $PgRestoreCandidates = @(
+                    Get-ChildItem $PgBin -Filter pg_restore.exe -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Directory.Name -eq "bin" }
+                )
+            }
+
+            if ($PgRestoreCandidates.Count -eq 0) {
+                throw "Nie znaleziono pg_restore.exe. Sprawdz instalacje PostgreSQL."
+            }
+
+            $PgRestore = $PgRestoreCandidates |
+				Sort-Object {
+					$VersionText = $_.Directory.Parent.Name -replace '[^0-9].*$', ''
+					[int]$VersionText
+				} -Descending |
+				Select-Object -First 1 -ExpandProperty FullName
+
+            $DbHost = Get-EnvValue "DB_HOST" "localhost"
+            $DbPort = Get-EnvValue "DB_PORT" "5432"
+            $DbName = Get-EnvValue "DB_NAME" "football_predictor"
+            $DbUser = Get-EnvValue "DB_USER" "postgres"
+            $DbPassword = Get-EnvValue "DB_PASSWORD" ""
+
+            # Najpierw sprawdzamy, czy plik jest poprawna kopia pg_dump.
+            & $PgRestore --list $BackupFile | Out-Null
+
+            if ($LASTEXITCODE -ne 0) {
+                throw "Plik football_predictor.backup jest nieprawidlowy lub nie mozna go odczytac."
+            }
+
+            # Jesli haslo jest zapisane w .env, uzyj go bez umieszczania
+            # hasla w argumentach procesu. Jesli nie, pg_restore zapyta o haslo.
+            $PreviousPgPassword = $env:PGPASSWORD
+            $HadPgPassword = Test-Path Env:PGPASSWORD
+
+            try {
+                if (-not [string]::IsNullOrEmpty($DbPassword)) {
+                    $env:PGPASSWORD = $DbPassword
+                }
+                else {
+                    Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+                }
+
+                $RestoreArgs = @(
+                    "--host=$DbHost",
+                    "--port=$DbPort",
+                    "--username=$DbUser",
+                    "--dbname=$DbName",
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                    "--no-privileges",
+                    "--exit-on-error",
+                    $BackupFile
+                )
+
+                & $PgRestore @RestoreArgs
+
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Przywracanie bazy nie powiodlo sie. Sprawdz haslo, wersje PostgreSQL i komunikaty powyzej."
+                }
+            }
+            finally {
+                if ($HadPgPassword) {
+                    $env:PGPASSWORD = $PreviousPgPassword
+                }
+                else {
+                    Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+                }
+            }
+
+            Write-Host "Dane z kopii zostaly przywrocone." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Pominieto przywracanie kopii. Baza pozostaje bez importu danych." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "Pominieto import: brak football_predictor.backup."
+    }
+
+    # ---------------------------------------------------------
+    # 8. Zakonczenie
     # ---------------------------------------------------------
 
     Write-Step "Instalacja zakonczona"
 
-    Write-Host "Zaleznosci zostaly zainstalowane."
-    Write-Host "Konfiguracja bazy i tworzenie tabel zostaly wykonane."
-    Write-Host "Aplikacje uruchamiaj dotychczasowym plikiem UruchomFootballPredictor.vbs."
+    Write-Host "Zaleznosci Pythona zostaly zainstalowane." -ForegroundColor Green
+    Write-Host "Baza danych i tabele zostaly przygotowane." -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Aplikacje uruchamiaj plikiem UruchomFootballPredictor.vbs."
+    Write-Host "Nie utworzono skrotow ani dodatkowych plikow uruchamiajacych."
 }
 catch {
     Write-Host "`nBLAD: $($_.Exception.Message)" -ForegroundColor Red
